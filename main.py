@@ -1,0 +1,230 @@
+import os
+import re
+import json
+import time
+import logging
+from typing import List, Optional, Literal
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
+from google import genai
+from google.genai import types
+from google.genai.errors import APIError
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("rhythm")
+
+app = FastAPI(title="Project Rhythm — Adaptive AI Guardian API")
+
+# =========================================================
+# SCHEMAS
+# =========================================================
+
+class ScheduleBlock(BaseModel):
+    time: str = Field(description="Formatted time range, e.g. '06:00 AM - 07:00 AM'")
+    start: int = Field(description="Start time in minutes from midnight (0-1439)")
+    dur: int = Field(description="Duration in minutes, typically 60 or 120")
+    activity: str = Field(description="Activity name, e.g. 'Deep Study', 'Breakfast', 'Recovery Break'")
+    type: Literal["study", "play", "meal", "break", "flex"] = "flex"
+    done: bool = False
+
+class ChatMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    text: str
+
+class GuideChatRequest(BaseModel):
+    student_name: str = ""
+    tone: Literal["Gentle", "Balanced", "Direct"] = "Balanced"
+    mode: str = "Daily Coach"
+    user_message: str
+    current_time_str: str = ""
+    current_minutes: int = 0
+    emotion: str = "Balanced"
+    wake: str = "06:00"
+    sleep: str = "22:00"
+    study_hours_target: int = 5
+    play_hours_target: int = 2
+    completed_study_hours: float = 0.0
+    remaining_study_hours: float = 0.0
+    hours_left_in_day: float = 0.0
+    backlog_hours: float = 0.0
+    current_blocks: List[ScheduleBlock] = Field(default_factory=list)
+    chat_history: List[ChatMessage] = Field(default_factory=list)
+    learned_memory: List[str] = Field(default_factory=list)
+    memory_last_7_days: dict = Field(default_factory=dict)
+
+class GuideChatResponse(BaseModel):
+    reply: str = Field(description="Clear, empathetic, specific response addressing the student's exact question, remaining hours, and concrete options.")
+    proposed_blocks: Optional[List[ScheduleBlock]] = Field(
+        default=None,
+        description="If the student asks to rearrange, lighten, shift, or optimize today's schedule, return the complete updated list of blocks for the day (preserving completed blocks and meal anchors). Otherwise null."
+    )
+    backlog_delta: float = Field(
+        default=0.0,
+        description="Change to student's study backlog in hours (e.g. +1.0 if 1h of today's study is moved to backlog, -1.0 if 1h of backlog is scheduled into today)."
+    )
+    action_label: Optional[str] = Field(
+        default=None,
+        description="Short one-click button label if proposed_blocks or backlog_delta is provided."
+    )
+    learned_preference: Optional[str] = Field(
+        default=None,
+        description="If this message reveals a lasting habit or preference, summarize it in <=10 words. Otherwise null."
+    )
+    is_crisis: bool = Field(
+        default=False,
+        description="True ONLY if the user expresses severe distress, hopelessness, or self-harm."
+    )
+
+class SuggestedAction(BaseModel):
+    type: Literal["none", "adjust_load", "add_break", "crisis_support"] = "none"
+    study_hours_delta: int = 0
+    extra_breaks: int = 0
+    button_label: Optional[str] = None
+
+class GuideResponse(BaseModel):
+    reply: str
+    suggested_action: SuggestedAction
+
+class GuideRequest(BaseModel):
+    student_name: str = ""
+    tone: Literal["Gentle", "Balanced", "Direct"] = "Balanced"
+    today: dict
+    memory_last_7_days: dict = Field(default_factory=dict)
+
+# =========================================================
+# SYSTEM INSTRUCTIONS
+# =========================================================
+
+CONVERSATIONAL_GUARDIAN_PROMPT = """
+You are Rhythm Guide AI, an emotionally intelligent, schedule-aware daily planning companion for students.
+
+YOUR CORE CAPABILITIES:
+1. READ THE LIVE SCHEDULE: You are given the student's exact `current_blocks`, `current_time_str`, `completed_study_hours`, `remaining_study_hours`, `hours_left_in_day`, and `backlog_hours`. Always ground your advice in their REAL numbers — never give generic platitudes.
+2. ANSWER ANY STUDY QUESTION: If the student asks a general question (e.g. how to prepare for an exam, how to improve a subject), give a concrete, practical answer first, then connect it to their schedule. Do NOT just repeat their schedule status.
+3. REARRANGE SEAMLESSLY: When the student asks to change, lighten, shift, or explore options for their routine:
+   - Present 2 clear, practical possibilities in `reply`.
+   - Provide the BEST recommended rearranged full-day schedule in `proposed_blocks` so they can apply it in ONE click.
+   - RULES FOR `proposed_blocks`:
+     * Keep all blocks where `done == true` unchanged.
+     * Keep all `meal` blocks at their exact times.
+     * Keep `start` (minutes from midnight), `dur` (minutes, multiples of 60), and `time` ("HH:MM AM - HH:MM PM") mathematically consistent and sorted chronologically within wake..sleep.
+     * Set `action_label` to a specific button label.
+4. MANAGE BACKLOG HONESTLY: If the student cannot realistically finish `remaining_study_hours` within `hours_left_in_day`, acknowledge it without guilt and set `backlog_delta` (e.g. +1.0). If they ask to clear backlog today, add a study block and set `backlog_delta` negative.
+5. LEARN FROM EVERY INPUT: Use `learned_memory` to personalize. If a new lasting preference appears, return a concise `learned_preference` (max 10 words).
+6. TONE & SAFETY:
+   - Match `tone` (Gentle, Balanced, Direct) and `mode` (Daily Coach, Schedule Reset, Study Strategy, Calm & Focus).
+   - Keep `reply` concise, with short bullet points when listing options, and warm.
+   - If severe distress or self-harm is mentioned, set `is_crisis = true`, `proposed_blocks = null`, and provide calm care with Tele-MANAS (14416) helpline info.
+"""
+
+PLAN_GREETING_PROMPT = """
+You are Rhythm, an emotionally intelligent daily planning guardian for students.
+Reply in 2-3 short, specific sentences: acknowledge their mood/target, ground in their streak and backlog (if any), and give one small next step.
+Match the requested tone (Gentle, Balanced, Direct).
+If Tired, Stressed, or study_hours >= 7, suggest lightening study load (-1h study, +1 break) with a clear button_label.
+"""
+
+# =========================================================
+# GEMINI HELPERS
+# =========================================================
+
+def get_client() -> genai.Client:
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(status_code=500, detail="GEMINI_API_KEY is not configured on Render.")
+    return genai.Client(api_key=api_key)
+
+def model_list() -> List[str]:
+    """Set GEMINI_MODEL on Render (comma-separated) to override. Defaults are tried in order."""
+    env = [m.strip() for m in os.environ.get("GEMINI_MODEL", "").split(",") if m.strip()]
+    defaults = ["gemini-3.5-flash", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
+    return env + [m for m in defaults if m not in env]
+
+def _parse(schema, text: str):
+    t = (text or "").strip()
+    t = re.sub(r"^```(?:json)?|```$", "", t, flags=re.M).strip()
+    return schema.model_validate_json(t)
+
+def call_gemini_with_retry(client: genai.Client, prompt: str, system_instruction: str, schema):
+    errors: List[str] = []
+    for model_name in model_list():
+        for use_schema in (True, False):
+            schema_problem = False
+            for attempt in range(2):
+                try:
+                    cfg = {"response_mime_type": "application/json", "temperature": 0.5}
+                    si = system_instruction
+                    if use_schema:
+                        cfg["response_schema"] = schema
+                    else:
+                        si += "\n\nReturn ONLY valid JSON matching this JSON schema:\n" + json.dumps(schema.model_json_schema())
+                    resp = client.models.generate_content(
+                        model=model_name,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(system_instruction=si, **cfg),
+                    )
+                    return _parse(schema, resp.text)
+                except APIError as e:
+                    msg = f"{model_name}: HTTP {getattr(e, 'code', '?')} {str(e)[:180]}"
+                    errors.append(msg)
+                    log.warning(msg)
+                    if getattr(e, "code", 0) in (429, 500, 502, 503, 504) and attempt == 0:
+                        time.sleep(2)
+                        continue
+                    break
+                except Exception as e:  # schema conversion / JSON parse problems
+                    msg = f"{model_name}: {type(e).__name__} {str(e)[:180]}"
+                    errors.append(msg)
+                    log.warning(msg)
+                    schema_problem = True
+                    break
+            if not schema_problem:
+                break  # real API problem (bad model, quota, key) — try the next model instead
+    raise HTTPException(status_code=502, detail="Gemini failed. " + " | ".join(errors[-4:]))
+
+# =========================================================
+# ROUTES
+# =========================================================
+
+@app.get("/")
+def serve_frontend():
+    for path in ["rhythm_planner.html", "static/rhythm_planner.html", "rhythm.html", "index.html"]:
+        if os.path.exists(path):
+            return FileResponse(path)
+    raise HTTPException(status_code=404, detail="Frontend HTML file not found next to main.py")
+
+@app.get("/api/health")
+def health_check(test: bool = False):
+    """Open /api/health?test=true in the browser to see which Gemini models really work."""
+    key = bool(os.environ.get("GEMINI_API_KEY", "").strip())
+    out = {"status": "ok", "api_key_configured": key, "models": model_list(),
+           "routes": ["/api/chat", "/api/guide"]}
+    if test and key:
+        client = get_client()
+        results = {}
+        for m in model_list():
+            try:
+                client.models.generate_content(model=m, contents="Reply with the single word OK")
+                results[m] = "working"
+            except Exception as e:
+                results[m] = f"FAILED: {str(e)[:220]}"
+        out["model_test"] = results
+    return out
+
+@app.post("/api/chat", response_model=GuideChatResponse)
+def chat_with_guide(req: GuideChatRequest):
+    client = get_client()
+    context_payload = req.model_dump()
+    context_payload["chat_history"] = [m.model_dump() for m in req.chat_history[-8:]]
+    prompt = (
+        f"LIVE STUDENT CONTEXT:\n{json.dumps(context_payload, indent=2)}\n\n"
+        f"STUDENT'S LATEST MESSAGE:\n{req.user_message}"
+    )
+    return call_gemini_with_retry(client, prompt, CONVERSATIONAL_GUARDIAN_PROMPT, GuideChatResponse)
+
+@app.post("/api/guide", response_model=GuideResponse)
+def get_guide_response(req: GuideRequest):
+    client = get_client()
+    prompt = f"Student daily plan context:\n{json.dumps(req.model_dump(), indent=2)}"
+    return call_gemini_with_retry(client, prompt, PLAN_GREETING_PROMPT, GuideResponse)
